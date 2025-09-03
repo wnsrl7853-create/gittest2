@@ -1,0 +1,69 @@
+name: CI → Build & Push to GHCR
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "web/**"
+      - "Dockerfile"
+      - ".github/workflows/ci-ghcr.yml"
+
+permissions:
+  contents: write
+  packages: write
+  actions: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine next version (auto bump patch)
+        id: ver
+        shell: bash
+        run: |
+          latest_tag=$(git tag -l 'v*' | sort -V | tail -n1)
+          if [ -z "$latest_tag" ]; then
+            next="1.0.0"
+          else
+            ver="${latest_tag#v}"
+            IFS='.' read -r MA MI PA <<< "$ver"
+            PA=$((PA+1))
+            next="${MA}.${MI}.${PA}"
+          fi
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.next }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      - name: Create & Push Git Tag
+        if: ${{ github.ref == 'refs/heads/main' }}
+        run: |
+          ver=${{ steps.ver.outputs.next }}
+          git config user.name  "${GITHUB_ACTOR}"
+          git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
+          git tag -a "v${ver}" -m "Release v${ver}"
+          git push origin "v${ver}"
