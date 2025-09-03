@@ -1,6 +1,11 @@
 name: CI → Multi-Component Build & Push (GHCR)
 
 on:
+  workflow_dispatch:
+    inputs:
+      components:
+        description: "Force-build components (comma-separated), leave empty for auto-detect"
+        required: false
   push:
     branches: [ "main" ]
     paths:
@@ -25,7 +30,6 @@ jobs:
     outputs:
       changed_list: ${{ steps.mk.outputs.changed_list }}
       any_changed:  ${{ steps.mk.outputs.any_changed }}
-      version:      ${{ steps.ver.outputs.next }}
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -45,21 +49,19 @@ jobs:
           [ "${{ steps.filter.outputs.web }}" = 'true' ] && comps+=("\"web\"")
           [ "${{ steps.filter.outputs.was }}" = 'true' ] && comps+=("\"was\"")
           [ "${{ steps.filter.outputs.db  }}" = 'true' ] && comps+=("\"db\"")
+          # manual force-build
+          if [ -n "${{ github.event.inputs.components }}" ]; then
+            IFS=',' read -ra FORCED <<< "${{ github.event.inputs.components }}"
+            comps=()
+            for c in "${FORCED[@]}"; do comps+=("\"$(echo "$c" | xargs)\""); done
+          fi
           if [ ${#comps[@]} -eq 0 ]; then
             echo "any_changed=false" >> $GITHUB_OUTPUT
             echo 'changed_list=[]'   >> $GITHUB_OUTPUT
           else
-            echo "any_changed=true"             >> $GITHUB_OUTPUT
-            echo "changed_list=[${comps[*]}]"   >> $GITHUB_OUTPUT
+            echo "any_changed=true" >> $GITHUB_OUTPUT
+            echo "changed_list=[${comps[*]}]" >> $GITHUB_OUTPUT
           fi
-
-      - id: ver
-        shell: bash
-        run: |
-          latest=$(git tag -l 'v*' | sort -V | tail -n1)
-          if [ -z "$latest" ]; then next="1.0.0";
-          else ver="${latest#v}"; IFS='.' read -r MA MI PA <<< "$ver"; PA=$((PA+1)); next="${MA}.${MI}.${PA}"; fi
-          echo "next=$next" >> $GITHUB_OUTPUT
 
   build:
     needs: plan
@@ -71,34 +73,48 @@ jobs:
         component: ${{ fromJSON(needs.plan.outputs.changed_list) }}
     steps:
       - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
       - uses: docker/setup-buildx-action@v3
+
       - uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ▶ 컴포넌트별 버전 계산 (v-<comp>-X.Y.Z)
+      - name: Determine next version for ${{ matrix.component }}
+        id: ver
+        shell: bash
+        run: |
+          prefix="v-${{ matrix.component }}-"
+          latest=$(git tag -l "${prefix}*" | sed "s/^${prefix}//" | sort -V | tail -n1)
+          if [ -z "$latest" ]; then
+            next="1.0.0"
+          else
+            IFS='.' read -r MA MI PA <<< "$latest"
+            PA=$((PA+1))
+            next="${MA}.${MI}.${PA}"
+          fi
+          echo "next=$next" >> $GITHUB_OUTPUT
+          echo "git_tag=${prefix}${next}" >> $GITHUB_OUTPUT
+          echo "Next version: ${prefix}${next}"
+
       - uses: docker/build-push-action@v6
         with:
           context: ./${{ matrix.component }}
           file: ./${{ matrix.component }}/Dockerfile
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.OWNER }}/${{ env.REPO }}-${{ matrix.component }}:${{ needs.plan.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.OWNER }}/${{ env.REPO }}-${{ matrix.component }}:${{ steps.ver.outputs.next }}
             ${{ env.REGISTRY }}/${{ env.OWNER }}/${{ env.REPO }}-${{ matrix.component }}:latest
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.OWNER }}/${{ env.REPO }}-${{ matrix.component }}:buildcache
           cache-to:   type=registry,ref=${{ env.REGISTRY }}/${{ env.OWNER }}/${{ env.REPO }}-${{ matrix.component }}:buildcache,mode=max
 
-  tag:
-    needs: [plan, build]
-    if: needs.plan.outputs.any_changed == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Push git tag once
+      - name: Push component git tag
         run: |
-          ver=${{ needs.plan.outputs.version }}
           git config user.name  "${GITHUB_ACTOR}"
           git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
-          git tag -a "v${ver}" -m "Release v${ver}"
-          git push origin "v${ver}"
-
+          git tag -a "${{ steps.ver.outputs.git_tag }}" -m "${{ matrix.component }} ${{ steps.ver.outputs.next }}"
+          git push origin "${{ steps.ver.outputs.git_tag }}"
